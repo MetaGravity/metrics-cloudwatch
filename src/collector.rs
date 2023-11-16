@@ -10,6 +10,7 @@ use std::{
 };
 
 use {
+    ahash::HashMapExt,
     aws_sdk_cloudwatch::{
         error::SdkError,
         operation::put_metric_data::PutMetricDataError,
@@ -157,6 +158,7 @@ struct HistogramDatum {
 
 pub struct RecorderHandle {
     sender: mpsc::Sender<Datum>,
+    storage: std::sync::Mutex<HashMap<metrics::KeyName, CloudWatchMetric>>,
 }
 
 pub(crate) fn init(
@@ -237,6 +239,7 @@ pub fn new(mut config: Config) -> (RecorderHandle, impl Future<Output = ()>) {
     (
         RecorderHandle {
             sender: collect_sender,
+            storage: std::sync::Mutex::new(HashMap::new()),
         },
         async move {
             futures_util::join!(collection_fut, emitter);
@@ -700,46 +703,164 @@ impl Collector {
     }
 }
 
-impl Recorder for RecorderHandle {
-    fn register_counter(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
+impl RecorderHandle {
+
+    fn describe_metrics(
+        &self,
+        name: metrics::KeyName,
+        unit: Option<metrics::Unit>,
+        _description: metrics::SharedString,
+    ) {
+        let metric: CloudWatchMetric;
+        let mut key = metrics::Key::from_name(name.clone());
+        let unit_str = unit_cloudwatch_str(&unit.expect("Unit not defined")).
+                                            expect("Unable to convert unit into string");
+
+        key = key.with_extra_labels(vec![metrics::Label::new("@unit", unit_str)]);
+        let mut storage = self.storage.lock().unwrap();
+        match storage.get(&name) {
+            Some(_entry) => {
+                return;
+            },
+            None => {
+                metric = CloudWatchMetric{sender: self.sender.clone(), key: key.clone(), 
+                    _description: _description.to_owned(), _unit: unit};
+                storage.insert(name.clone(), metric); 
+            },
+        };
+
+        let _token = quote::quote!{#*_description};
         let _ = self.sender.try_send(Datum {
-            key: key.clone(),
-            value: Value::Register { unit, description },
+            key: key,
+            value: Value::Register { unit: unit, 
+                description: Some(stringify!(_token))},
         });
     }
 
-    fn register_gauge(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
+    fn register_metrics (&self, key: &metrics::Key) -> CloudWatchMetric {
+        let mut storage = self.storage.lock().unwrap();
+        let (keyname, _labels) = key.clone().into_parts();
+
+        if let Some(metric) =  storage.get(&keyname) {
+            return metric.clone();
+        }
+        
+        let metric =  CloudWatchMetric{sender: self.sender.clone(), 
+            key: key.clone(), _description: metrics::SharedString::from(""), _unit: None};
+        
         let _ = self.sender.try_send(Datum {
             key: key.clone(),
-            value: Value::Register { unit, description },
+            value: Value::Register { unit: None, description: None },
+        });
+        
+        storage.insert(keyname, metric.clone());
+
+        metric
+    }
+}
+
+impl metrics::Recorder for RecorderHandle
+{
+    fn describe_counter(
+        &self,
+        name: metrics::KeyName,
+        unit: Option<metrics::Unit>,
+        description: metrics::SharedString,
+    ) {
+        self.describe_metrics(name, unit, description);
+    }
+
+    fn describe_gauge(
+        &self,
+        name: metrics::KeyName,
+        unit: Option<metrics::Unit>,
+        description: metrics::SharedString,
+    ) {
+        self.describe_metrics(name, unit, description);
+    }
+
+    fn describe_histogram(
+        &self,
+        name: metrics::KeyName,
+        unit: Option<metrics::Unit>,
+        description: metrics::SharedString,
+    ) {
+        self.describe_metrics(name, unit, description);
+    }
+
+    fn register_counter(&self, key: &metrics::Key) -> metrics::Counter {
+        metrics::Counter::from_arc(std::sync::Arc::new(
+            self.register_metrics(key)
+        ))
+    }
+
+    fn register_gauge(&self, key: &metrics::Key) -> metrics::Gauge {
+        metrics::Gauge::from_arc(std::sync::Arc::new(
+            self.register_metrics(key)
+        ))
+    }
+
+    fn register_histogram(&self, key: &metrics::Key) -> metrics::Histogram {
+        metrics::Histogram::from_arc(std::sync::Arc::new(
+            self.register_metrics(key)
+        ))
+    }
+}
+
+#[derive(Clone)]
+pub struct CloudWatchMetric {
+    sender: mpsc::Sender<Datum>,
+    key: Key,
+    _description: metrics::SharedString,
+    _unit: Option<metrics::Unit>,
+}
+
+impl metrics::CounterFn for CloudWatchMetric {
+    fn increment(&self, val: u64) {
+        let _ = self.sender.try_send(Datum {
+            key: self.key.clone(),
+            value: Value::Counter(val),
+        });        
+    }
+
+    fn absolute(&self, _val: u64) {
+        // TODO: to be implemented
+    }
+}
+
+impl metrics::GaugeFn for CloudWatchMetric {
+    /// Increments the gauge by the given amount.
+    fn increment(&self, value: f64) {
+        let _ = self.sender.try_send(Datum {
+            key: self.key.clone(),
+            value: Value::Gauge(GaugeValue::Increment(value)),
         });
     }
 
-    fn register_histogram(&self, key: &Key, unit: Option<Unit>, description: Option<&'static str>) {
+    /// Decrements the gauge by the given amount.
+    fn decrement(&self, value: f64) {
         let _ = self.sender.try_send(Datum {
-            key: key.clone(),
-            value: Value::Register { unit, description },
+            key: self.key.clone(),
+            value: Value::Gauge(GaugeValue::Decrement(value)),
         });
     }
 
-    fn increment_counter(&self, key: &Key, value: u64) {
+    /// Sets the gauge to the given amount.
+    fn set(&self, value: f64) {
         let _ = self.sender.try_send(Datum {
-            key: key.clone(),
-            value: Value::Counter(value),
+            key: self.key.clone(),
+            value: Value::Gauge(GaugeValue::Absolute(value)),
         });
     }
 
-    fn update_gauge(&self, key: &Key, value: GaugeValue) {
-        let _ = self.sender.try_send(Datum {
-            key: key.clone(),
-            value: Value::Gauge(value),
-        });
-    }
+}
 
-    fn record_histogram(&self, key: &Key, value: f64) {
+impl metrics::HistogramFn for CloudWatchMetric
+{
+    fn record(&self, value: f64) {
         if value.is_finite() {
             let _ = self.sender.try_send(Datum {
-                key: key.clone(),
+                key: self.key.clone(),
                 value: Value::Histogram(HistogramValue::new(value).unwrap()),
             });
         }
